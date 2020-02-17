@@ -1,0 +1,16 @@
+apiVersion : apps/v1beta1
+kind: Deployment
+metadata:
+  name: angularappkubernetes 
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: angularappkubernetes 
+    spec:
+      containers:
+        - name: angularappkubernetes 
+          image: containerkube.azurecr.io/angularappkubernetes 
+          ports:
+          - containerPort: 80
