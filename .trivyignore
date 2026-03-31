@@ -1,0 +1,5 @@
+# .trivyignore
+# Suppress known / accepted Trivy CVEs for this project.
+# Format: one CVE ID per line.  Add a comment to explain the acceptance decision.
+# Example:
+#   CVE-2021-12345  # accepted risk: only exploitable with local access, mitigated by network policy

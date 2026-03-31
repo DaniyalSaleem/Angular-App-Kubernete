@@ -1,52 +1,182 @@
 # Deploy to Azure Kubernetes Service
 # Build and push image to Azure Container Registry; Deploy to Azure Kubernetes Service
 # https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+#
+# Triggers:
+#   - push to master        → CI + Docker build/scan/push + Deploy
+#   - push of a v* tag      → CI + Docker build/scan/push (SHA + version tag) + Deploy
+#   - pull request          → CI only (no Docker push, no Deploy)
 
 trigger:
-- master
+  branches:
+    include:
+    - master
+  tags:
+    include:
+    - 'v*'
+
+pr:
+  branches:
+    include:
+    - '*'
 
 resources:
 - repo: self
 
 variables:
-
   # Container registry service connection established during pipeline creation
   dockerRegistryServiceConnection: 'c6e06586-67be-442f-8439-4028152c545e'
   imageRepository: 'angularappkubernetes'
   containerRegistry: 'containerkube.azurecr.io'
-  dockerfilePath: '**/Dockerfile'
-  tag: '$(Build.BuildId)'
+  dockerfilePath: 'Dockerfile'
   imagePullSecret: 'containerkube495473e0-auth'
 
   # Agent VM image name
   vmImageName: 'ubuntu-latest'
-  
 
+  # Pinned Node.js version for deterministic installs
+  nodeVersion: '16.x'
+
+
+# ─── Stage 1: Lint, Test & Build ────────────────────────────────────────────
 stages:
-- stage: Build
-  displayName: Build stage
-  jobs:  
-  - job: Build
-    displayName: Build
+- stage: CI
+  displayName: 'Lint, Test & Build'
+  jobs:
+  - job: CI
+    displayName: 'CI'
     pool:
       vmImage: $(vmImageName)
     steps:
-    - task: Docker@2
-      displayName: Build and push an image to container registry
+
+    - task: NodeTool@0
+      displayName: 'Use Node.js $(nodeVersion)'
       inputs:
-        command: buildAndPush
-        repository: $(imageRepository)
-        dockerfile: $(dockerfilePath)
+        versionSpec: $(nodeVersion)
+
+    - script: npm ci
+      displayName: 'Install dependencies (npm ci)'
+
+    - script: npm run lint
+      displayName: 'Lint'
+
+    - script: npm audit --audit-level=high
+      displayName: 'Dependency vulnerability scan (npm audit)'
+
+    - script: bash scripts/ci-test.sh
+      displayName: 'Unit tests (ChromeHeadlessNoSandbox)'
+
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish code coverage'
+      condition: succeededOrFailed()
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/coverage/cobertura-coverage.xml'
+        reportDirectory: '$(System.DefaultWorkingDirectory)/coverage'
+        failIfCoverageEmpty: false
+
+    - script: npm run build -- --prod
+      displayName: 'Production build'
+
+
+# ─── Stage 2: Docker Build, Scan & Push ─────────────────────────────────────
+- stage: Docker
+  displayName: 'Docker Build & Scan'
+  dependsOn: CI
+  condition: succeeded()
+  jobs:
+  - job: DockerBuildScanPush
+    displayName: 'Build, Scan & Push'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+
+    # Compute a short (8-char) SHA used as the primary immutable image tag
+    - script: |
+        SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-8)
+        echo "##vso[task.setvariable variable=shortSha]${SHORT_SHA}"
+        echo "Short SHA: ${SHORT_SHA}"
+      displayName: 'Compute short SHA'
+
+    # Log in to ACR so subsequent docker CLI commands are authenticated
+    - task: Docker@2
+      displayName: 'Log in to ACR'
+      inputs:
+        command: login
         containerRegistry: $(dockerRegistryServiceConnection)
-        tags: |
-          $(tag)
-          
+
+    # Build the image and tag it with both the full SHA and the short SHA
+    - script: |
+        IMAGE_BASE="$(containerRegistry)/$(imageRepository)"
+        docker build \
+          -t "${IMAGE_BASE}:$(Build.SourceVersion)" \
+          -t "${IMAGE_BASE}:$(shortSha)" \
+          -f $(dockerfilePath) .
+      displayName: 'Build Docker image'
+
+    # Install Trivy
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+          | sh -s -- -b /usr/local/bin
+        trivy --version
+      displayName: 'Install Trivy'
+
+    # Scan the locally built image; fail on HIGH or CRITICAL findings
+    - script: |
+        trivy image \
+          --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --ignore-unfixed \
+          --ignorefile .trivyignore \
+          "$(containerRegistry)/$(imageRepository):$(shortSha)"
+      displayName: 'Trivy vulnerability scan'
+
     - upload: manifests
       artifact: manifests
 
+    # Push SHA-based tags (master and tag builds only)
+    - script: |
+        IMAGE_BASE="$(containerRegistry)/$(imageRepository)"
+        docker push "${IMAGE_BASE}:$(Build.SourceVersion)"
+        docker push "${IMAGE_BASE}:$(shortSha)"
+        echo "Pushed tags: $(Build.SourceVersion), $(shortSha)"
+      displayName: 'Push image (SHA tags)'
+      condition: >
+        and(
+          succeeded(),
+          or(
+            eq(variables['Build.SourceBranch'], 'refs/heads/master'),
+            startsWith(variables['Build.SourceBranch'], 'refs/tags/')
+          )
+        )
+
+    # When triggered by a v* Git tag, also push the version tag (e.g. v1.2.3)
+    - script: |
+        VERSION_TAG=$(echo "$(Build.SourceBranch)" | sed 's|refs/tags/||')
+        IMAGE_BASE="$(containerRegistry)/$(imageRepository)"
+        docker tag "${IMAGE_BASE}:$(Build.SourceVersion)" "${IMAGE_BASE}:${VERSION_TAG}"
+        docker push "${IMAGE_BASE}:${VERSION_TAG}"
+        echo "Pushed release tag: ${VERSION_TAG}"
+      displayName: 'Push version tag'
+      condition: >
+        and(
+          succeeded(),
+          startsWith(variables['Build.SourceBranch'], 'refs/tags/v')
+        )
+
+
+# ─── Stage 3: Deploy to AKS ─────────────────────────────────────────────────
 - stage: Deploy
-  displayName: Deploy stage
-  dependsOn: Build
+  displayName: 'Deploy to AKS'
+  dependsOn: Docker
+  condition: >
+    and(
+      succeeded(),
+      or(
+        eq(variables['Build.SourceBranch'], 'refs/heads/master'),
+        startsWith(variables['Build.SourceBranch'], 'refs/tags/v')
+      )
+    )
 
   jobs:
   - deployment: Deploy
@@ -64,7 +194,7 @@ stages:
               action: createSecret
               secretName: $(imagePullSecret)
               dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
-              
+
           - task: KubernetesManifest@0
             displayName: Deploy to Kubernetes cluster
             inputs:
@@ -75,5 +205,5 @@ stages:
               imagePullSecrets: |
                 $(imagePullSecret)
               containers: |
-                $(containerRegistry)/$(imageRepository):$(tag)
+                $(containerRegistry)/$(imageRepository):$(Build.SourceVersion)
 
